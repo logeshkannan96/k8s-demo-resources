@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hw-demo
+  namespace: demo
+  labels:
+    app: hw-demo
+    training: kubernetes-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hw-demo
+  template:
+    metadata:
+      labels:
+        app: hw-demo
+    spec:
+      containers:
+      - name: hw-demo
+        image: logeshneo/k8-demo-hw:latest
+        ports:
+        - containerPort: 3000
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: MESSAGE
+          valueFrom:
+            configMapKeyRef:
+              name: demo-config
+              key: message
+        resources:
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+          requests:
+            cpu: "200m"
+            memory: "256Mi"

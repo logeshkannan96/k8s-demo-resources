@@ -1,0 +1,152 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-secrets
+  namespace: demo
+data:
+  root-password: c2VjdXJlcGFzc3dvcmQxMjM= # Base64-encoded "securepassword123"
+  repl-password: cmVwbC1wYXNzd29yZDEyMw== # Base64-encoded "repl-password123"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-config
+  namespace: demo
+data:
+  my.cnf: |
+    [mysqld]
+    server-id=1
+    log-bin=mysql-bin
+    binlog-format=ROW
+    gtid-mode=ON
+    enforce-gtid-consistency=ON
+    bind-address=0.0.0.0
+    max_connections=100
+    innodb_buffer_pool_size=256M
+  mysql-credentials.cnf: |
+    [client]
+    user=root
+    password=securepassword123
+  init-replication.sh: |
+    #!/bin/bash
+    # Dynamically set server-id based on pod ordinal
+    ORDINAL=${HOSTNAME##*-}
+    sed -i "s/server-id=1/server-id=$((ORDINAL + 1))/g" /etc/mysql/conf.d/my.cnf
+    # Wait for MySQL to be ready
+    until mysql --defaults-file=/etc/mysql/credentials/mysql-credentials.cnf -e "SELECT 1"; do
+      echo "Waiting for MySQL to be ready..."
+      sleep 5
+    done
+    # Configure replication
+    if [[ "$ORDINAL" == "0" ]]; then
+      mysql --defaults-file=/etc/mysql/credentials/mysql-credentials.cnf -e "CREATE USER 'repl'@'%' IDENTIFIED WITH mysql_native_password BY 'repl-password123';"
+      mysql --defaults-file=/etc/mysql/credentials/mysql-credentials.cnf -e "GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
+    else
+      mysql --defaults-file=/etc/mysql/credentials/mysql-credentials.cnf -e "CHANGE MASTER TO MASTER_HOST='mysql-0.mysql-service.demo.svc.cluster.local', MASTER_USER='repl', MASTER_PASSWORD='repl-password123', MASTER_AUTO_POSITION=1;"
+      mysql --defaults-file=/etc/mysql/credentials/mysql-credentials.cnf -e "START SLAVE;"
+    fi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-service
+  namespace: demo
+  labels:
+    app: mysql
+spec:
+  clusterIP: None # Headless service
+  ports:
+  - port: 3306
+    targetPort: 3306
+    protocol: TCP
+    name: mysql
+  selector:
+    app: mysql
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: demo
+spec:
+  serviceName: mysql-service
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      initContainers:
+      - name: init-replication
+        image: mysql:8.0
+        command: ["/bin/bash", "/docker-entrypoint-initdb.d/init-replication.sh"]
+        volumeMounts:
+        - name: init-script
+          mountPath: /docker-entrypoint-initdb.d
+        - name: config
+          mountPath: /etc/mysql/conf.d
+        - name: credentials
+          mountPath: /etc/mysql/credentials
+      containers:
+      - name: mysql
+        image: mysql:8.0
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secrets
+              key: root-password
+        ports:
+        - containerPort: 3306
+          name: mysql
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+        - name: config
+          mountPath: /etc/mysql/conf.d
+        - name: credentials
+          mountPath: /etc/mysql/credentials
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+        readinessProbe:
+          exec:
+            command: ["mysql", "--defaults-file=/etc/mysql/credentials/mysql-credentials.cnf", "-h", "localhost", "-e", "SELECT 1"]
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 5
+      volumes:
+      - name: config
+        configMap:
+          name: mysql-config
+          items:
+          - key: my.cnf
+            path: my.cnf
+      - name: credentials
+        configMap:
+          name: mysql-config
+          items:
+          - key: mysql-credentials.cnf
+            path: mysql-credentials.cnf
+      - name: init-script
+        configMap:
+          name: mysql-config
+          items:
+          - key: init-replication.sh
+            path: init-replication.sh
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: standard # Changed to GCP PD storage class
+      resources:
+        requests:
+          storage: 5Gi
